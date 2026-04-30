@@ -99,3 +99,174 @@ It will take a couple seconds, but an output will show up that looks similar to 
 Figure 40: Output of test3_og.py
 
 At this point, you can use the keyboard to control the robot manually. 
+
+## 2. Adding a New Attack to the GUI
+
+This section explains how to add a new attack to `gui0.py`. The dashboard is data-driven, meaning every attack is defined in one place and the GUI builds itself from that definition. You will need to make changes in **five locations** inside `gui0.py`. All five must be consistent with each other, or the live command preview and the actual executed command will disagree.
+
+---
+
+### 2.1 Define the Attack in the `ATTACKS` List
+
+Near the top of `gui0.py` there is a Python list called `ATTACKS`. Each entry is a dictionary that defines everything about one attack — its label, category, color, and all of its configurable fields. Add a new dictionary to this list following the same structure as the existing four attacks.
+
+A minimal example:
+
+```python
+{
+    "id":          "your_attack_id",
+    "label":       "Your Attack Name — tool (Layer X)",
+    "description": "One or two sentences describing what this attack does.",
+    "category":    "Layer X / DoS",
+    "color":       "#HEXCOLOR",
+    "params": [
+        {
+            "id":          "ip",
+            "label":       "Target IP",
+            "type":        "text",
+            "default":     "",
+            "placeholder": "192.168.x.x",
+            "required":    True,
+        },
+        {
+            "id":      "port",
+            "label":   "Target Port",
+            "type":    "number",
+            "default": "80",
+            "min":     1,
+            "max":     65535,
+            "hint":    "80=HTTP · 443=HTTPS · 22=SSH",
+        },
+    ],
+},
+```
+
+**Field reference for each param:**
+
+| Key | Required | Description |
+|---|---|---|
+| `id` | Yes | Snake_case identifier. Must be unique within this attack's params. |
+| `label` | Yes | Display name shown above the input in the GUI. |
+| `type` | Yes | One of: `text`, `number`, `select`, `checkbox` |
+| `default` | Yes | Pre-filled value when the attack is first selected. |
+| `placeholder` | No | Hint text inside the input when empty. |
+| `hint` | No | Small grey help text shown below the field. |
+| `required` | No | Set `True` to block launch if the field is empty. Fields with `id: "ip"` also trigger IPv4 format validation automatically. |
+| `min` / `max` | No | Number fields only. Enforced both in the browser and server-side. |
+| `options` | No | Select fields only. List of `{"value": "x", "label": "Display Name"}` dicts. |
+| `depends_on` | No | Hides this field unless another param matches a value. Example: `{"mode": "count"}` hides this field unless the `mode` param is set to `"count"`. |
+
+**Important:** The `id` string you pick here is what connects this entry to all four of the locations below. It must match exactly everywhere.
+
+---
+
+### 2.2 Add a Branch to `build_command()` (Python)
+
+`build_command()` takes the attack id and a dict of param values and returns the full shell command string that gets executed on the Pi. Find this function and add an `if` block for your new attack.
+
+```python
+if atk_id == "your_attack_id":
+    cmd = f"sudo yourtool --flag {p.get('param_id', 'fallback')}"
+    if p.get("optional_flag", "") not in ("", "0"):
+        cmd += f" --optional {p['optional_flag']}"
+    return f"{cmd} {p['ip']}"   # target IP always goes last
+```
+
+Rules to follow:
+- Use `p.get("key", "fallback")` instead of `p["key"]` so missing optional params don't crash
+- Always put the target IP at the end of the command as a positional argument — this is correct syntax for hping3 and most tools
+- Include `sudo` at the start if the tool requires root
+- Return the command as a single string — the route calls `shlex.split()` on it before passing to `subprocess.Popen`
+
+---
+
+### 2.3 Add a Branch to `validate_params()` (Python)
+
+`validate_params()` runs on the server before `build_command()` is ever called. It is the last line of defense after the browser-side checks. Add an `elif` block that returns a plain error string if something is wrong, or `None` if everything is valid.
+
+```python
+elif atk_id == "your_attack_id":
+    if not _valid_ip(p.get("ip", "")):
+        return "Invalid target IP"
+    try:
+        port = int(p.get("port", ""))
+        if not (1 <= port <= 65535):
+            raise ValueError
+    except Exception:
+        return "Port must be 1–65535"
+```
+
+Two helper functions are already defined in the file for you to reuse:
+- `_valid_ip(ip)` — returns `True` if the string is a valid IPv4 address
+- `_int_in_range(val, lo, hi)` — returns `True` if the string converts to an int within the given range
+
+The error string you return is sent directly to the browser as a red log line, so write it as a clear human-readable sentence.
+
+---
+
+### 2.4 Add a Branch to `buildCmd()` (JavaScript)
+
+`buildCmd()` is the JavaScript mirror of `build_command()`. It runs on every keypress and dropdown change to update the live command preview at the bottom of the Parameters card. It must produce the exact same output as the Python function for the same inputs.
+
+Find this function in the `<script>` block near the bottom of the `PAGE` string and add an `if` block:
+
+```javascript
+if (id === 'your_attack_id') {
+    let cmd = 'sudo yourtool --flag ' + (vals.param_id || 'fallback');
+    if (vals.optional_flag && vals.optional_flag !== '0') {
+        cmd += ' --optional ' + vals.optional_flag;
+    }
+    return cmd + ' ' + (vals.ip || '<target-ip>');
+}
+```
+
+Notes:
+- Pull values from the `vals` object, which holds the current state of all param fields
+- Use `|| 'fallback'` the same way Python uses `.get()` with a fallback
+- For checkbox params, `vals.param_id` will be the boolean `true` or `false`, not a string — check it with `if (vals.param_id)` not `if (vals.param_id === 'true')`
+- `'<target-ip>'` is the placeholder shown in the preview when the IP field is empty
+
+---
+
+### 2.5 Add a Branch to `autoFilter()` (JavaScript)
+
+`autoFilter()` generates a BPF filter string for the tshark capture card when the user clicks the "Auto-fill" button. Find this function and add an `else if` block for your attack:
+
+```javascript
+else if (atk.id === 'your_attack_id') {
+    f = 'tcp and host ' + vals.ip + ' and port ' + vals.port;
+}
+```
+
+Common BPF patterns:
+- ICMP-based attack: `'icmp and host ' + vals.ip`
+- TCP-based attack: `'tcp and host ' + vals.ip + ' and port ' + vals.port`
+- Wireless frame attack: `'wlan type mgt subtype deauth'`
+- Passive/general capture: `'not arp and not broadcast'`
+
+If you skip this step the auto-fill button will produce an empty filter for your attack, which is not harmful but unhelpful.
+
+---
+
+### 2.6 Checklist Before Testing
+
+Go through this before running `python3 gui0.py`:
+
+- [ ] The `id` string in the `ATTACKS` entry exactly matches the string in all four `if/elif/else if` blocks
+- [ ] Every param `id` referenced in `build_command()` and `buildCmd()` matches a param `id` defined in the `ATTACKS` entry
+- [ ] Any param with `depends_on` references another param `id` that actually exists in the same attack's params list
+- [ ] Python `build_command()` and JavaScript `buildCmd()` produce the same command for the same inputs
+- [ ] The binary being called is installed on the Pi — the output log will show a red "Tool not found" error if it is not
+- [ ] `sudo` is included in the command string if the tool requires root
+
+---
+
+### 2.7 Summary of All Five Locations
+
+| Location | Language | What You Add |
+|---|---|---|
+| `ATTACKS` list | Python | Full attack dict with id, label, description, category, color, and params |
+| `build_command()` | Python | `if atk_id ==` branch that returns the shell command string |
+| `validate_params()` | Python | `elif atk_id ==` branch that returns an error string or `None` |
+| `buildCmd()` | JavaScript | `if (id === )` branch that returns the same command for the live preview |
+| `autoFilter()` | JavaScript | `else if (atk.id === )` branch that sets the BPF filter string |
